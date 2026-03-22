@@ -1,0 +1,7 @@
+discord.py
+aiohttp
+PyNaCl
+yt-dlp
+spotipy
+Flask
+wavelink
